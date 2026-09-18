@@ -34,6 +34,7 @@ from google.ads.googleads.client import GoogleAdsClient
 from google_auth_oauthlib.flow import Flow
 from jinja2 import DictLoader, Environment
 from starlette.middleware.sessions import SessionMiddleware
+from urllib.parse import parse_qsl, urlencode
 
 
 # =============================================================================
@@ -823,8 +824,8 @@ SCOPES = ["https://www.googleapis.com/auth/adwords"]
 REQUIRED_ENV = ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "SESSION_SECRET")
 MISSING_ENV = [v for v in REQUIRED_ENV if not os.getenv(v)]
 
-app = FastAPI(title="Google Ads Audit Tool")
-app.add_middleware(
+api = FastAPI(title="Google Ads Audit Tool")
+api.add_middleware(
     SessionMiddleware,
     secret_key=os.getenv("SESSION_SECRET") or secrets.token_hex(32),
     max_age=60 * 60 * 24 * 30,
@@ -834,7 +835,7 @@ app.add_middleware(
 templates = Jinja2Templates(env=Environment(loader=DictLoader(TEMPLATES), autoescape=True))
 
 
-@app.middleware("http")
+@api.middleware("http")
 async def require_setup(request: Request, call_next):
     """Show a friendly setup page instead of crashing when env vars are missing."""
     if MISSING_ENV:
@@ -889,14 +890,14 @@ def _error(request: Request, title: str, exc: Exception | str, status: int = 500
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-@app.get("/", response_class=HTMLResponse)
+@api.get("/", response_class=HTMLResponse)
 def home(request: Request):
     if request.session.get("refresh_token"):
         return RedirectResponse("/accounts")
     return templates.TemplateResponse(request, "index.html", {"redirect_uri": REDIRECT_URI})
 
 
-@app.get("/auth/google")
+@api.get("/auth/google")
 def auth_start(request: Request):
     flow = _flow()
     url, state = flow.authorization_url(
@@ -905,7 +906,7 @@ def auth_start(request: Request):
     return RedirectResponse(url)
 
 
-@app.get("/auth/google/callback")
+@api.get("/auth/google/callback")
 def auth_callback(request: Request):
     if request.query_params.get("error"):
         return _error(request, "Google sign-in failed", request.query_params["error"], 400)
@@ -924,7 +925,7 @@ def auth_callback(request: Request):
     return RedirectResponse("/accounts")
 
 
-@app.get("/accounts", response_class=HTMLResponse)
+@api.get("/accounts", response_class=HTMLResponse)
 def accounts(request: Request):
     token = request.session.get("refresh_token")
     if not token:
@@ -937,7 +938,7 @@ def accounts(request: Request):
                                       {"accounts": accts, "errors": errors})
 
 
-@app.get("/audit/{customer_id}", response_class=HTMLResponse)
+@api.get("/audit/{customer_id}", response_class=HTMLResponse)
 def audit_page(request: Request, customer_id: str, login: str | None = None):
     token = request.session.get("refresh_token")
     if not token:
@@ -950,10 +951,37 @@ def audit_page(request: Request, customer_id: str, login: str | None = None):
                                       {"r": result, "today": date.today().strftime("%d %b %Y")})
 
 
-@app.get("/logout")
+@api.get("/logout")
 def logout(request: Request):
     request.session.clear()
     return RedirectResponse("/")
+
+
+class VercelPathFix:
+    """Vercel may hand the app the path '/api/index' (with the real page in ?__path=).
+    Restore the real path so FastAPI routes work both on Vercel and locally."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            path = scope.get("path", "/")
+            params = parse_qsl(scope.get("query_string", b"").decode(), keep_blank_values=True)
+            forced = [v for k, v in params if k == "__path"]
+            params = [(k, v) for k, v in params if k != "__path"]
+            if forced:
+                path = "/" + forced[0].lstrip("/")
+            elif path.startswith("/api/index"):
+                path = path[len("/api/index"):] or "/"
+            scope["path"] = path
+            scope["raw_path"] = path.encode()
+            scope["query_string"] = urlencode(params).encode()
+            scope["root_path"] = ""
+        await self.inner(scope, receive, send)
+
+
+app = VercelPathFix(api)
 
 
 if __name__ == "__main__":
