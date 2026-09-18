@@ -1,10 +1,10 @@
 """
-api/index.py — Google Ads Audit Tool, single-file version.
+api/index.py — Google Ads Audit Tool, single-file version (v2: 5 audit types).
 
 Everything is in this one file so it can be uploaded to GitHub in one go:
   1. HTML templates      (TEMPLATES dict)
-  2. Audit engine        (data pull + 12 rules; thresholds in CONFIG)
-  3. FastAPI web app     (OAuth login, account list, report)
+  2. Audit engine        (data pull + 18 rules; thresholds in CONFIG; AUDIT_TYPES)
+  3. FastAPI web app     (OAuth login, account list, audit chooser, report)
 
 Runs on Vercel as a serverless function, or locally with:  python api/index.py
 """
@@ -17,12 +17,12 @@ from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qsl, urlencode
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Allow http://localhost during development (Google requires https in production)
 os.environ.setdefault("OAUTHLIB_INSECURE_TRANSPORT", "1")
 os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
@@ -34,7 +34,6 @@ from google.ads.googleads.client import GoogleAdsClient
 from google_auth_oauthlib.flow import Flow
 from jinja2 import DictLoader, Environment
 from starlette.middleware.sessions import SessionMiddleware
-from urllib.parse import parse_qsl, urlencode
 
 
 # =============================================================================
@@ -48,72 +47,95 @@ TEMPLATES = {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}Google Ads Audit Tool{% endblock %}</title>
 <style>
-  :root{--bg:#f6f7f9;--card:#fff;--ink:#1a1d23;--muted:#6b7280;--line:#e5e7eb;
-        --blue:#1a56db;--high:#dc2626;--med:#d97706;--low:#2563eb;--ok:#16a34a;}
+  :root{--navy:#0f3d8a;--navy-2:#0b2a63;--amber:#ffb547;--sky:#8fb3ff;--bg:#f3f5f9;--card:#fff;
+        --ink:#14203a;--muted:#5f6b85;--line:#e3e8f0;--high:#d92d20;--med:#dc8a10;--low:#2563eb;--ok:#12934f}
   *{box-sizing:border-box}
-  body{margin:0;font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-       background:var(--bg);color:var(--ink);line-height:1.5}
-  header{background:#fff;border-bottom:1px solid var(--line);padding:14px 24px;
-         display:flex;justify-content:space-between;align-items:center}
-  header a{color:var(--muted);text-decoration:none;font-size:14px;margin-left:16px}
-  .brand{font-weight:700;font-size:16px;color:var(--ink)!important;margin:0!important}
-  main{max-width:1040px;margin:32px auto;padding:0 20px}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:24px;margin-bottom:20px}
-  h1{font-size:26px;margin:0 0 8px}h2{font-size:18px;margin:0 0 12px}
+  body{margin:0;font-family:"Segoe UI",-apple-system,Roboto,Helvetica,Arial,sans-serif;background:var(--bg);color:var(--ink);line-height:1.5}
+  header{background:var(--navy);color:#fff;padding:0 32px;height:64px;display:flex;justify-content:space-between;align-items:center}
+  .brand{display:flex;align-items:center;gap:12px;color:#fff;text-decoration:none;font-weight:700;font-size:17px;letter-spacing:.01em}
+  .mark{width:36px;height:36px;border-radius:10px;background:var(--navy-2);display:grid;place-items:center}
+  header nav a{color:#c7d6f5;text-decoration:none;font-size:14px;margin-left:22px}
+  header nav a:hover{color:#fff}
+  .hero{background:var(--navy);color:#fff;padding:28px 32px 36px;margin-bottom:-24px}
+  .hero .wrap{max-width:1080px;margin:0 auto}
+  .hero h1{color:#fff}
+  .hero p{color:#c7d6f5;margin:0}
+  main{max-width:1080px;margin:32px auto;padding:0 24px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:26px 28px;margin-bottom:20px;box-shadow:0 1px 2px rgba(20,32,58,.04)}
+  h1{font-size:28px;margin:0 0 6px;letter-spacing:-.01em}h2{font-size:18px;margin:0 0 14px}
+  .eyebrow{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--amber)}
   p.muted{color:var(--muted);margin:0 0 16px}
-  .btn{display:inline-block;background:var(--blue);color:#fff;padding:11px 20px;border-radius:8px;
-       text-decoration:none;font-weight:600;border:0;cursor:pointer;font-size:15px}
+  .btn{display:inline-block;background:var(--navy);color:#fff;padding:12px 22px;border-radius:10px;text-decoration:none;font-weight:600;border:0;cursor:pointer;font-size:15px}
+  .btn.amber{background:var(--amber);color:var(--ink)}
   .btn.secondary{background:#fff;color:var(--ink);border:1px solid var(--line)}
+  .btn.small{padding:8px 14px;font-size:14px;border-radius:8px}
   table{width:100%;border-collapse:collapse;font-size:14px}
-  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
-  th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.03em}
-  .tag{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:700;color:#fff}
-  .tag.High{background:var(--high)}.tag.Medium{background:var(--med)}.tag.Low{background:var(--low)}
-  .tag.ok{background:var(--ok)}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
+  .tag{display:inline-block;padding:3px 11px;border-radius:999px;font-size:12px;font-weight:700;color:#fff}
+  .tag.High{background:var(--high)}.tag.Medium{background:var(--med)}.tag.Low{background:var(--low)}.tag.ok{background:var(--ok)}
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
-  .stat{background:var(--bg);border-radius:10px;padding:14px}
-  .stat .v{font-size:22px;font-weight:700}.stat .l{font-size:12px;color:var(--muted)}
-  .score{display:flex;align-items:center;gap:24px}
-  .ring{width:120px;height:120px;border-radius:50%;display:grid;place-items:center;
-        font-size:34px;font-weight:800;color:#fff;flex:none}
-  .finding{border-left:5px solid var(--line);padding-left:18px;margin-bottom:26px}
-  .finding.High{border-color:var(--high)}.finding.Medium{border-color:var(--med)}.finding.Low{border-color:var(--low)}
-  .finding h3{margin:0 0 6px;font-size:17px}
-  .fix{background:#f0f6ff;border-radius:8px;padding:10px 14px;margin:10px 0;font-size:14px}
-  .fix b{color:var(--blue)}
-  details summary{cursor:pointer;color:var(--blue);font-size:14px;margin:6px 0}
+  .stat{background:var(--bg);border-radius:12px;padding:16px}
+  .stat .v{font-size:24px;font-weight:700;letter-spacing:-.01em}.stat .l{font-size:12px;color:var(--muted);margin-top:2px}
+  .types{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+  .type{display:flex;gap:16px;padding:20px;border:1px solid var(--line);border-radius:14px;text-decoration:none;color:var(--ink);background:#fff;transition:border-color .15s,box-shadow .15s}
+  .type:hover{border-color:var(--navy);box-shadow:0 4px 14px rgba(15,61,138,.10)}
+  .type .ico{width:48px;height:48px;border-radius:12px;background:#eaf0fb;display:grid;place-items:center;flex:none}
+  .type b{display:block;font-size:16px;margin-bottom:2px}.type small{color:var(--muted);font-size:13px}
+  .type.primary{background:var(--navy);color:#fff;border-color:var(--navy)}.type.primary .ico{background:var(--navy-2)}.type.primary small{color:#c7d6f5}
+  .score{display:flex;align-items:center;gap:28px}
+  .ring{position:relative;width:140px;height:140px;flex:none}
+  .ring svg{transform:rotate(-90deg)}
+  .ring .n{position:absolute;inset:0;display:grid;place-items:center;font-size:38px;font-weight:800;color:#fff}
+  .finding{border:1px solid var(--line);border-left:6px solid var(--line);border-radius:12px;padding:18px 20px;margin-bottom:16px}
+  .finding.High{border-left-color:var(--high)}.finding.Medium{border-left-color:var(--med)}.finding.Low{border-left-color:var(--low)}
+  .finding h3{margin:6px 0 6px;font-size:17px}
+  .fix{background:#eaf0fb;border-radius:10px;padding:12px 16px;margin:12px 0 4px;font-size:14px}
+  .fix b{color:var(--navy)}
+  details summary{cursor:pointer;color:var(--navy);font-size:14px;margin:8px 0 4px;font-weight:600}
   .scroll{overflow-x:auto}
-  code{background:#eef;padding:1px 5px;border-radius:4px;font-size:13px}
-  @media print{header,.noprint{display:none}body{background:#fff}.card{border:0;padding:0}
+  code{background:#eaf0fb;padding:1px 6px;border-radius:5px;font-size:13px}
+  .footer{color:var(--muted);font-size:13px;text-align:center;margin:28px 0}
+  @media print{header,.noprint,.hero{display:none}body{background:#fff}.card{border:0;padding:0;box-shadow:none}
                details{display:block}details summary{display:none}details>*{display:block}}
 </style>
 </head>
 <body>
 <header>
-  <a class="brand" href="/">Google Ads Audit Tool</a>
+  <a class="brand" href="/"><span class="mark">
+    <svg width="22" height="22" viewBox="0 0 176 176" fill="none" xmlns="http://www.w3.org/2000/svg"><rect x="26" y="96" width="22" height="46" rx="5" fill="#8fb3ff"/><rect x="58" y="70" width="22" height="72" rx="5" fill="#8fb3ff"/><rect x="90" y="48" width="22" height="94" rx="5" fill="#8fb3ff"/><circle cx="112" cy="64" r="40" fill="#0b2a63" stroke="#ffb547" stroke-width="12"/><path d="M141 93 L166 118" stroke="#ffb547" stroke-width="14" stroke-linecap="round"/><path d="M94 65 L106 77 L130 51" stroke="#ffb547" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/></svg>
+  </span>Google Ads Audit Tool</a>
   <nav>{% block nav %}{% endblock %}</nav>
 </header>
+{% block hero %}{% endblock %}
 <main>{% block body %}{% endblock %}</main>
+<p class="footer noprint">Read-only · nothing in your Google Ads account is changed</p>
 </body>
 </html>
 """,
     "index.html": r"""{% extends "base.html" %}
 {% block body %}
-<div class="card" style="text-align:center;padding:56px 24px">
-  <h1>One-click Google Ads audit</h1>
-  <p class="muted">Connect a Google account that has access to your Google Ads accounts.<br>
-  The tool reads the last 30 days and checks 12 rules. Nothing in the account is changed.</p>
-  <a class="btn" href="/auth/google">Connect Google Ads</a>
-  <p class="muted" style="margin-top:20px;font-size:13px">Read-only. Your login is kept only in a cookie in this browser.<br>OAuth redirect URI in use: <code>{{ redirect_uri }}</code></p>
+<div class="card" style="text-align:center;padding:64px 32px">
+  <div class="eyebrow">Free · read-only · 2 minutes</div>
+  <h1 style="font-size:36px;margin-top:8px">Audit your Google Ads account in one click</h1>
+  <p class="muted" style="max-width:560px;margin:0 auto 26px">Connect the Google account that manages your ads, choose an account and an audit type, and get a scored report with exact fixes.</p>
+  <a class="btn amber" href="/auth/google" style="font-size:16px;padding:14px 28px">Connect Google Ads</a>
+  <div class="types" style="margin-top:44px;text-align:left">
+    <div class="type"><div class="ico">{{ icon("overall") }}</div><div><b>Overall audit</b><small>Every check in one report</small></div></div>
+    <div class="type"><div class="ico">{{ icon("conversions") }}</div><div><b>Conversions</b><small>Is tracking working and bidding aligned?</small></div></div>
+    <div class="type"><div class="ico">{{ icon("waste") }}</div><div><b>Wasted budget</b><small>Where money leaks out</small></div></div>
+    <div class="type"><div class="ico">{{ icon("ctr") }}</div><div><b>Low CTR</b><small>Why people aren't clicking</small></div></div>
+    <div class="type"><div class="ico">{{ icon("keywords") }}</div><div><b>Low-performing keywords</b><small>Keywords that cost more than they return</small></div></div>
+  </div>
+  <p class="muted" style="margin-top:28px;font-size:12px">OAuth redirect URI: <code>{{ redirect_uri }}</code></p>
 </div>
 {% endblock %}
 """,
     "accounts.html": r"""{% extends "base.html" %}
 {% block nav %}<a href="/logout">Log out</a>{% endblock %}
+{% block hero %}<div class="hero"><div class="wrap"><div class="eyebrow">Step 1 of 2</div><h1>Choose an account</h1><p>Every non-manager account this Google login can reach.</p></div></div>{% endblock %}
 {% block body %}
 <div class="card">
-  <h1>Choose an account</h1>
-  <p class="muted">Every non-manager account this Google login can reach.</p>
   {% if accounts %}
   <table>
     <tr><th>Account</th><th>ID</th><th>Currency</th><th>Access</th><th></th></tr>
@@ -123,7 +145,7 @@ TEMPLATES = {
       <td>{{ a.id[:3] }}-{{ a.id[3:6] }}-{{ a.id[6:] }}</td>
       <td>{{ a.currency }}</td>
       <td>{{ "via manager" if a.via_mcc else "direct" }}</td>
-      <td style="text-align:right"><a class="btn" href="/audit/{{ a.id }}?login={{ a.login }}">Run audit</a></td>
+      <td style="text-align:right"><a class="btn small" href="/choose/{{ a.id }}?login={{ a.login }}">Choose audit →</a></td>
     </tr>
     {% endfor %}
   </table>
@@ -138,16 +160,33 @@ TEMPLATES = {
 </div>
 {% endblock %}
 """,
+    "choose.html": r"""{% extends "base.html" %}
+{% block nav %}<a href="/accounts">Accounts</a><a href="/logout">Log out</a>{% endblock %}
+{% block hero %}<div class="hero"><div class="wrap"><div class="eyebrow">Step 2 of 2</div><h1>What do you want to audit?</h1><p>Account {{ customer_id[:3] }}-{{ customer_id[3:6] }}-{{ customer_id[6:] }} · last 30 days</p></div></div>{% endblock %}
+{% block body %}
+<div class="card">
+  <div class="types">
+    {% for key, t in types.items() %}
+    <a class="type {{ 'primary' if key == 'overall' else '' }}" href="/audit/{{ customer_id }}?login={{ login }}&type={{ key }}">
+      <div class="ico">{{ icon(key) }}</div>
+      <div><b>{{ t.name }}</b><small>{{ t.description }}</small></div>
+    </a>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}
+""",
     "error.html": r"""{% extends "base.html" %}
 {% block nav %}<a href="/accounts">Accounts</a><a href="/logout">Log out</a>{% endblock %}
 {% block body %}
 <div class="card">
+  <div class="eyebrow" style="color:var(--high)">Something went wrong</div>
   <h1>{{ title }}</h1>
   {% if hints %}
   <div class="fix"><b>Likely cause</b><ul style="margin:6px 0 0">{% for h in hints %}<li>{{ h }}</li>{% endfor %}</ul></div>
   {% endif %}
   <details open><summary>Technical details</summary>
-    <pre style="white-space:pre-wrap;font-size:13px;background:#f3f4f6;padding:12px;border-radius:8px">{{ message }}</pre>
+    <pre style="white-space:pre-wrap;font-size:13px;background:#f3f5f9;padding:12px;border-radius:8px">{{ message }}</pre>
   </details>
   <p><a class="btn secondary" href="/accounts">Back to accounts</a></p>
 </div>
@@ -155,18 +194,22 @@ TEMPLATES = {
 """,
     "report.html": r"""{% extends "base.html" %}
 {% set a = r.account %}
-{% block title %}Audit — {{ a.name }}{% endblock %}
-{% block nav %}<a href="/accounts">Accounts</a><a href="#" onclick="window.print();return false">Print / PDF</a><a href="/logout">Log out</a>{% endblock %}
+{% block title %}{{ r.audit_name }} — {{ a.name }}{% endblock %}
+{% block nav %}<a href="/choose/{{ r.customer_id }}?login={{ login }}">Other audits</a><a href="/accounts">Accounts</a><a href="#" onclick="window.print();return false">Print / PDF</a><a href="/logout">Log out</a>{% endblock %}
 {% block body %}
-{% set colour = "var(--ok)" if r.score >= 80 else ("var(--med)" if r.score >= 55 else "var(--high)") %}
-<div class="card">
+{% set colour = "#12934f" if r.score >= 80 else ("#dc8a10" if r.score >= 55 else "#d92d20") %}
+{% set dash = 408 * r.score / 100 %}
+<div class="card" style="background:var(--navy);color:#fff;border:0">
   <div class="score">
-    <div class="ring" style="background:{{ colour }}">{{ r.score }}</div>
+    <div class="ring">
+      <svg width="140" height="140" viewBox="0 0 140 140"><circle cx="70" cy="70" r="65" stroke="#0b2a63" stroke-width="10" fill="none"/><circle cx="70" cy="70" r="65" stroke="{{ colour }}" stroke-width="10" fill="none" stroke-linecap="round" stroke-dasharray="{{ '%.1f'|format(dash) }} 408"/></svg>
+      <div class="n">{{ r.score }}</div>
+    </div>
     <div>
-      <h1>{{ a.name }}</h1>
-      <p class="muted" style="margin:0">Customer ID {{ r.customer_id[:3] }}-{{ r.customer_id[3:6] }}-{{ r.customer_id[6:] }}
-        · {{ today }} · last 30 days · {{ r.campaign_count }} campaigns, {{ r.keyword_count }} keywords, {{ r.ad_count }} ads</p>
-      <p style="margin:8px 0 0">
+      <div class="eyebrow">{{ r.audit_name }}</div>
+      <h1 style="color:#fff">{{ a.name }}</h1>
+      <p style="margin:0;color:#c7d6f5">ID {{ r.customer_id[:3] }}-{{ r.customer_id[3:6] }}-{{ r.customer_id[6:] }} · {{ today }} · last 30 days · {{ r.checks_run }} checks · {{ r.campaign_count }} campaigns, {{ r.keyword_count }} keywords, {{ r.ad_count }} ads</p>
+      <p style="margin:10px 0 0">
         <span class="tag High">{{ r.counts.High }} high</span>
         <span class="tag Medium">{{ r.counts.Medium }} medium</span>
         <span class="tag Low">{{ r.counts.Low }} low</span>
@@ -192,12 +235,12 @@ TEMPLATES = {
 
 <div class="card">
   <h2>Findings</h2>
-  {% if not r.findings %}<p>No issues found by the current rules. Nice account.</p>{% endif %}
+  {% if not r.findings %}<p>No issues found by this audit's checks. Nice account.</p>{% endif %}
   {% for f in r.findings %}
   <div class="finding {{ f.severity }}">
     <span class="tag {{ f.severity }}">{{ f.severity }}</span>
     <h3>{{ f.title }}</h3>
-    <p style="margin:0 0 6px">{{ f.detail }}</p>
+    <p style="margin:0 0 6px;color:var(--muted)">{{ f.detail }}</p>
     <div class="fix"><b>Fix:</b> {{ f.fix }}</div>
     {% if f.examples %}
     <details><summary>Show {{ f.examples|length }} example row(s)</summary>
@@ -217,17 +260,17 @@ TEMPLATES = {
   <p>{% for p in r.passed %}<span class="tag ok" style="margin:0 6px 6px 0">{{ p }}</span>{% endfor %}</p>
 </div>
 {% endif %}
-<p class="muted noprint" style="font-size:13px">Score = 100 − 15 per High, 7 per Medium, 3 per Low finding. Thresholds can be changed in <code>audit.py</code>.</p>
+<p class="muted noprint" style="font-size:13px">Score = 100 − 15 per High, 7 per Medium, 3 per Low finding, over the checks in this audit type.</p>
 {% endblock %}
 """,
     "setup.html": r"""{% extends "base.html" %}
 {% block body %}
 <div class="card">
+  <div class="eyebrow">Setup</div>
   <h1>Almost there — finish setup</h1>
   <p class="muted">The app is deployed but these settings are missing:</p>
   <ul>{% for m in missing %}<li><code>{{ m }}</code></li>{% endfor %}</ul>
-  <div class="fix"><b>On Vercel:</b> Project → Settings → Environment Variables → add each one → then
-    Deployments → ⋯ on the latest deployment → <b>Redeploy</b>.<br>
+  <div class="fix"><b>On Vercel:</b> Project → Settings → Environments → Production → Environment Variables → add each one → then Deployments → ⋯ → <b>Redeploy</b>.<br>
     <b>Locally:</b> copy <code>.env.example</code> to <code>.env</code> and fill it in.</div>
   <h2 style="margin-top:20px">Google Cloud OAuth client must also allow</h2>
   <table>
@@ -262,6 +305,11 @@ CONFIG = {
     "min_asset_types": 4,
     "smart_bidding_min_conv": 30,
     "max_examples": 15,            # rows shown per finding in the report
+    "low_ctr_campaign": 0.02,      # search campaign CTR below 2%
+    "low_ctr_campaign_min_impr": 100,
+    "low_ctr_keyword": 0.01,       # keyword CTR below 1%
+    "low_ctr_keyword_min_impr": 200,
+    "zero_conv_spend_multiplier": 2.0,  # campaign/keyword spend >= this x CPA with 0 conversions
 }
 
 WEIGHTS = {"High": 15, "Medium": 7, "Low": 3}
@@ -764,42 +812,219 @@ def rule_empty_ad_groups(data):
                     examples=_ex(empty), columns=["Campaign", "Ad group", "Missing"])]
 
 
+def rule_zero_conversion_campaigns(data):
+    cpa = data["account"]["cpa"]
+    thr = (cpa * CONFIG["zero_conv_spend_multiplier"]) if cpa else CONFIG["burn_fallback_cost"]
+    hit = [c for c in data["campaigns"] if c["conversions"] == 0 and c["cost"] >= thr]
+    if not hit:
+        return []
+    hit.sort(key=lambda c: -c["cost"])
+    wasted = round(sum(c["cost"] for c in hit), 2)
+    return [Finding("13", "High", f"{len(hit)} campaign(s) spent {wasted} with zero conversions",
+                    "Each of these spent at least " + (f"{CONFIG['zero_conv_spend_multiplier']:.0f}x the account CPA"
+                    if cpa else f"{CONFIG['burn_fallback_cost']}") + " in 30 days without a single conversion.",
+                    "Check conversion tracking on the landing pages these campaigns use, review their search terms, "
+                    "and pause or restructure anything that cannot be justified.",
+                    examples=_ex([{"Campaign": c["name"], "Cost": c["cost"], "Clicks": c["clicks"],
+                                   "Bidding": c["bidding"]} for c in hit]),
+                    columns=["Campaign", "Cost", "Clicks", "Bidding"])]
+
+
+def rule_no_primary_conversion(data):
+    acts = data["conversion_actions"]
+    if acts and not any(a["primary"] for a in acts):
+        return [Finding("14", "Medium", "No primary conversion action",
+                        "Conversion actions exist but none is marked primary, so Smart Bidding has no goal "
+                        "to optimise toward and the Conversions column may be empty.",
+                        "In Goals → Conversions, open the action that represents a real lead or sale and set "
+                        "it to Primary. Keep page views and micro-actions as Secondary.",
+                        examples=_ex([{"Action": a["name"], "Type": a["type"]} for a in acts]),
+                        columns=["Action", "Type"])]
+    return []
+
+
+def rule_low_ctr_campaigns(data):
+    hit = []
+    for c in _search_campaigns(data):
+        if c["impressions"] >= CONFIG["low_ctr_campaign_min_impr"]:
+            ctr = c["clicks"] / c["impressions"]
+            if ctr < CONFIG["low_ctr_campaign"]:
+                hit.append({"Campaign": c["name"], "CTR": f"{ctr:.2%}", "Impressions": c["impressions"],
+                            "Clicks": c["clicks"]})
+    if not hit:
+        return []
+    hit.sort(key=lambda r: r["CTR"])
+    return [Finding("15", "Medium", f"{len(hit)} search campaign(s) with CTR under "
+                    f"{CONFIG['low_ctr_campaign']:.0%}",
+                    "Low CTR lowers expected-CTR in Quality Score, raising CPCs and dropping position.",
+                    "Tighten keyword-to-ad relevance, add the keyword to headline 1, test stronger "
+                    "offers/CTAs, add all extension types, and exclude irrelevant search terms.",
+                    examples=_ex(hit), columns=["Campaign", "CTR", "Impressions", "Clicks"])]
+
+
+def rule_low_ctr_keywords(data):
+    hit = []
+    for k in data["keywords"]:
+        if k["impressions"] >= CONFIG["low_ctr_keyword_min_impr"]:
+            ctr = k["clicks"] / k["impressions"]
+            if ctr < CONFIG["low_ctr_keyword"]:
+                hit.append({"Keyword": k["keyword"], "Match": k["match"], "Ad group": k["ad_group"],
+                            "CTR": f"{ctr:.2%}", "Impressions": k["impressions"]})
+    if not hit:
+        return []
+    hit.sort(key=lambda r: -r["Impressions"])
+    return [Finding("16", "Medium", f"{len(hit)} keyword(s) with CTR under {CONFIG['low_ctr_keyword']:.0%}",
+                    "High-impression keywords that people rarely click are usually too broad or mismatched "
+                    "to the ad shown.",
+                    "Move them to a tighter ad group with a matching ad, switch broad to phrase/exact, or "
+                    "pause them.",
+                    examples=_ex(hit), columns=["Keyword", "Match", "Ad group", "CTR", "Impressions"])]
+
+
+def rule_keywords_spend_no_conversions(data):
+    cpa = data["account"]["cpa"]
+    thr = (cpa * CONFIG["zero_conv_spend_multiplier"]) if cpa else CONFIG["burn_fallback_cost"]
+    hit = [k for k in data["keywords"] if k["conversions"] == 0 and k["cost"] >= thr]
+    if not hit:
+        return []
+    hit.sort(key=lambda k: -k["cost"])
+    wasted = round(sum(k["cost"] for k in hit), 2)
+    return [Finding("17", "High", f"{len(hit)} keyword(s) spent {wasted} with zero conversions",
+                    "Keywords that consumed at least " + (f"{CONFIG['zero_conv_spend_multiplier']:.0f}x CPA"
+                    if cpa else f"{CONFIG['burn_fallback_cost']}") + " and returned nothing.",
+                    "Pause them, or lower their bids and add negatives around them. Check whether the landing "
+                    "page matches the intent.",
+                    examples=_ex([{"Keyword": k["keyword"], "Match": k["match"], "Campaign": k["campaign"],
+                                   "Cost": k["cost"], "Clicks": k["clicks"]} for k in hit]),
+                    columns=["Keyword", "Match", "Campaign", "Cost", "Clicks"])]
+
+
+def rule_top_wasted_spend_summary(data):
+    """Informational Low finding: where the money without conversions went."""
+    cpa = data["account"]["cpa"]
+    rows = [c for c in data["campaigns"] if c["conversions"] == 0 and c["cost"] > 0]
+    if not rows or cpa is None:
+        return []
+    total = round(sum(c["cost"] for c in rows), 2)
+    share = total / data["account"]["cost"] if data["account"]["cost"] else 0
+    if share < 0.10:
+        return []
+    return [Finding("18", "Low", f"{share:.0%} of spend ({total}) went to campaigns with no conversions",
+                    "A summary of non-converting spend across the account.",
+                    "Use the findings above to decide what to pause, fix or restructure.",
+                    examples=_ex([{"Campaign": c["name"], "Cost": c["cost"]} for c in
+                                  sorted(rows, key=lambda c: -c["cost"])]),
+                    columns=["Campaign", "Cost"])]
+
+
+AUDIT_TYPES = {
+    "overall": {
+        "name": "Overall audit",
+        "tagline": "Every check in one report",
+        "description": "All 12 core checks: tracking, ads, search terms, match types, budget, rank, Quality "
+                       "Score, RSAs, extensions, bidding, negatives and structure.",
+        "icon": "overall",
+        "rules": None,   # None = every core rule
+    },
+    "conversions": {
+        "name": "Conversions audit",
+        "tagline": "Is tracking working and is bidding aligned?",
+        "description": "Conversion actions, primary goals, campaigns spending without converting, and whether "
+                       "bid strategies match conversion volume.",
+        "icon": "conversions",
+        "rules": ["rule_conversion_tracking", "rule_no_primary_conversion",
+                  "rule_zero_conversion_campaigns", "rule_bidding_vs_volume", "rule_disapproved_ads"],
+    },
+    "waste": {
+        "name": "Wasted budget audit",
+        "tagline": "Where money leaks out",
+        "description": "Burn search terms, broad match without Smart Bidding, missing negatives, "
+                       "non-converting campaigns and keywords, and budget caps.",
+        "icon": "waste",
+        "rules": ["rule_burn_terms", "rule_keywords_spend_no_conversions", "rule_zero_conversion_campaigns",
+                  "rule_broad_match", "rule_negatives", "rule_budget_limited", "rule_top_wasted_spend_summary"],
+    },
+    "ctr": {
+        "name": "Low CTR audit",
+        "tagline": "Why people aren't clicking",
+        "description": "Campaigns and keywords with weak click-through rates, ad strength, extension coverage "
+                       "and rank loss.",
+        "icon": "ctr",
+        "rules": ["rule_low_ctr_campaigns", "rule_low_ctr_keywords", "rule_rsa_strength",
+                  "rule_extensions", "rule_rank_limited", "rule_disapproved_ads"],
+    },
+    "keywords": {
+        "name": "Low-performing keywords",
+        "tagline": "Keywords that cost more than they return",
+        "description": "Low Quality Score, spend with no conversions, low CTR, broad match risk and empty ad "
+                       "groups.",
+        "icon": "keywords",
+        "rules": ["rule_quality_score", "rule_keywords_spend_no_conversions", "rule_low_ctr_keywords",
+                  "rule_broad_match", "rule_burn_terms", "rule_empty_ad_groups"],
+    },
+}
+
+
 RULES = [
     rule_conversion_tracking, rule_disapproved_ads, rule_burn_terms, rule_broad_match,
     rule_budget_limited, rule_rank_limited, rule_quality_score, rule_rsa_strength,
     rule_extensions, rule_bidding_vs_volume, rule_negatives, rule_empty_ad_groups,
 ]
 
+RULE_FUNC_IDS = {
+    "1": "rule_conversion_tracking", "2": "rule_disapproved_ads", "3": "rule_burn_terms",
+    "4": "rule_broad_match", "5": "rule_budget_limited", "6": "rule_rank_limited",
+    "7": "rule_quality_score", "8": "rule_rsa_strength", "9": "rule_extensions",
+    "10": "rule_bidding_vs_volume", "11": "rule_negatives", "12": "rule_empty_ad_groups",
+    "13": "rule_zero_conversion_campaigns", "14": "rule_no_primary_conversion",
+    "15": "rule_low_ctr_campaigns", "16": "rule_low_ctr_keywords",
+    "17": "rule_keywords_spend_no_conversions", "18": "rule_top_wasted_spend_summary",
+}
+
 RULE_NAMES = {
     "1": "Conversion tracking", "2": "Disapproved ads", "3": "Burn search terms",
     "4": "Broad match risk", "5": "Budget limited", "6": "Rank limited", "7": "Quality Score",
     "8": "RSA strength", "9": "Extensions", "10": "Bidding vs volume", "11": "Negatives",
-    "12": "Empty ad groups",
+    "12": "Empty ad groups", "13": "Zero-conversion campaigns", "14": "Primary conversion set",
+    "15": "Campaign CTR", "16": "Keyword CTR", "17": "Keyword spend vs conversions",
+    "18": "Wasted spend share",
 }
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def run_audit_for(refresh_token: str, customer_id: str, login_customer_id: str | None = None) -> dict:
+def run_audit_for(refresh_token: str, customer_id: str, login_customer_id: str | None = None,
+              audit_type: str = "overall") -> dict:
+    spec = AUDIT_TYPES.get(audit_type) or AUDIT_TYPES["overall"]
     data = pull_data(refresh_token, customer_id, login_customer_id)
+    if spec["rules"] is None:
+        rules = list(RULES)
+    else:
+        rules = [globals()[name] for name in spec["rules"]]
     findings: list[Finding] = []
-    for rule in RULES:
+    for rule in rules:
         findings.extend(rule(data))
     order = {"High": 0, "Medium": 1, "Low": 2}
     findings.sort(key=lambda f: (order[f.severity], int(f.rule)))
     score = max(0, 100 - sum(WEIGHTS[f.severity] for f in findings))
-    passed = [RULE_NAMES[k] for k in RULE_NAMES if k not in {f.rule for f in findings}]
+    checked = {r.__name__ for r in rules}
+    rule_ids = {name: rid for rid, name in RULE_FUNC_IDS.items()}
+    passed = [RULE_NAMES[rule_ids[n]] for n in checked
+              if n in rule_ids and rule_ids[n] not in {f.rule for f in findings}]
     return {
         "account": data["account"],
         "customer_id": data["customer_id"],
+        "audit_type": audit_type if audit_type in AUDIT_TYPES else "overall",
+        "audit_name": spec["name"],
         "score": score,
         "findings": findings,
-        "passed": passed,
+        "passed": sorted(passed),
         "counts": {s: sum(1 for f in findings if f.severity == s) for s in ("High", "Medium", "Low")},
         "campaign_count": len(data["campaigns"]),
         "keyword_count": len(data["keywords"]),
         "ad_count": len(data["ads"]),
+        "checks_run": len(rules),
     }
 
 
@@ -833,6 +1058,22 @@ api.add_middleware(
     https_only=BASE_URL.startswith("https"),
 )
 templates = Jinja2Templates(env=Environment(loader=DictLoader(TEMPLATES), autoescape=True))
+
+ICONS = {
+    "overall": '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#0f3d8a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M8 13l3 3 5-6"/></svg>',
+    "conversions": '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#0f3d8a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/><path d="M12 3v3M21 12h-3"/></svg>',
+    "waste": '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#0f3d8a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16l-1.5 12h-13z"/><path d="M9 7V4h6v3M10 11v5M14 11v5"/></svg>',
+    "ctr": '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#0f3d8a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4l7 16 2-7 7-2z"/></svg>',
+    "keywords": '<svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#0f3d8a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M17 12v3M20 12v2"/></svg>',
+}
+
+
+def icon(key: str):
+    from markupsafe import Markup
+    return Markup(ICONS.get(key, ICONS["overall"]))
+
+
+templates.env.globals["icon"] = icon
 
 
 @api.middleware("http")
@@ -938,17 +1179,27 @@ def accounts(request: Request):
                                       {"accounts": accts, "errors": errors})
 
 
+@api.get("/choose/{customer_id}", response_class=HTMLResponse)
+def choose(request: Request, customer_id: str, login: str | None = None):
+    if not request.session.get("refresh_token"):
+        return RedirectResponse("/")
+    return templates.TemplateResponse(request, "choose.html",
+                                      {"customer_id": customer_id, "login": login or "",
+                                       "types": AUDIT_TYPES})
+
+
 @api.get("/audit/{customer_id}", response_class=HTMLResponse)
-def audit_page(request: Request, customer_id: str, login: str | None = None):
+def audit_page(request: Request, customer_id: str, login: str | None = None, type: str = "overall"):
     token = request.session.get("refresh_token")
     if not token:
         return RedirectResponse("/")
     try:
-        result = run_audit_for(token, customer_id, login)
+        result = run_audit_for(token, customer_id, login, type)
     except Exception as e:
         return _error(request, "Audit failed", e)
     return templates.TemplateResponse(request, "report.html",
-                                      {"r": result, "today": date.today().strftime("%d %b %Y")})
+                                      {"r": result, "login": login or "",
+                                       "today": date.today().strftime("%d %b %Y")})
 
 
 @api.get("/logout")
